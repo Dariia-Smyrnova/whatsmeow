@@ -7,8 +7,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,21 +17,23 @@ import (
 	"mime"
 	"net/http"
 	"os"
-	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal/v3"
-	"google.golang.org/protobuf/proto"
-
+	qrcode "github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	waBinary "go.mau.fi/whatsmeow/binary"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCommon"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -40,6 +42,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"google.golang.org/protobuf/proto"
 )
 
 var cli *whatsmeow.Client
@@ -52,7 +55,173 @@ var dbAddress = flag.String("db-address", "file:mdtest.db?_foreign_keys=on", "Da
 var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
 var pairRejectChan = make(chan bool, 1)
 
+type ClientManager struct {
+    clients map[string]*whatsmeow.Client
+    mutex   sync.Mutex
+    dbLog   waLog.Logger
+	eventChannel chan interface{}
+	container     *sqlstore.Container
+}
+
+func NewClientManager(container *sqlstore.Container) *ClientManager {
+    return &ClientManager{
+        clients: make(map[string]*whatsmeow.Client),
+        dbLog:   waLog.Stdout("Database", logLevel, true),
+		eventChannel: make(chan interface{}, 100), // Buffer size of 100, adjust as needed
+		container:    container,
+    }
+}
+
+func (cm *ClientManager) eventHandler(evt interface{}) {
+	log.Infof("Event occurred: %+v", evt)
+    cm.eventChannel <- evt
+}
+
+type SendMessageRequest struct {
+	Recipient string `json:"recipient"`
+	Message   string `json:"message"`
+	ClientID  string `json:"clientID"`
+}
+
+type SendMessageResponse struct {
+    Success   bool   `json:"success"`
+    Error     string `json:"error,omitempty"`
+}
+
+func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req SendMessageRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	recipient, ok := parseJID(req.Recipient)
+	if !ok {
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Error: "Invalid recipient JID"})
+		return
+	}
+
+	msg := &waProto.Message{
+		Conversation: proto.String(req.Message),
+	}
+
+    deviceStore, err := cm.container.GetFirstDevice()
+    if err != nil {
+        log.Errorf("Failed to get device: %v", err)
+        return
+    }
+
+ 	client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
+	_, err = client.SendMessage(context.Background(), recipient, msg)
+    if err != nil {
+        log.Errorf("Failed to send message: %v", err.Error())
+    }
+
+    json.NewEncoder(w).Encode(SendMessageResponse{Success: true})
+}
+
+var upgrader = websocket.Upgrader{
+    CheckOrigin: func(r *http.Request) bool {
+        return true // Allow all origins for simplicity. In production, you should restrict this.
+    },
+}
+
+func (cm *ClientManager) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+    conn, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        fmt.Println("Failed to upgrade connection:", err)
+        return
+    }
+    defer conn.Close()
+
+    clientID := uuid.New().String()
+
+    // Get device for clientID
+    deviceStore, err := cm.container.GetFirstDevice()
+    if err != nil {
+        log.Errorf("Failed to get device: %v", err)
+        return
+    }
+
+ 	client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
+ 	client.AddEventHandler(cm.eventHandler)
+
+    // Get QR channel
+    qrChan, err := client.GetQRChannel(context.Background())
+    if err != nil {
+        if errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+            err = client.Connect()
+            if err != nil {
+                log.Errorf(fmt.Sprintf("failed to connect to whatsapp client: %v", err))
+                return
+            }
+            cm.clients[clientID] = client
+            log.Errorf(fmt.Sprintf("failed to connect to database: %v", err))
+            return
+        }
+        conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to get QR channel: %v", err)})
+        return
+    }
+
+    // Start QR code handling
+    go func() {
+        for evt := range qrChan {
+            if evt.Event == "code" {
+                png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
+                if err != nil { 
+                    conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to generate QR code: %v", err)})
+                    return
+                }
+                base64QR := base64.StdEncoding.EncodeToString(png)
+                conn.WriteJSON(map[string]string{"qrCode": base64QR})
+            } else {
+                conn.WriteJSON(map[string]string{"status": evt.Event})
+            }
+        }
+    }()
+
+	go func() {
+        for evt := range cm.eventChannel {
+            switch v := evt.(type) {
+            case *events.Message:
+                // Handle incoming messages
+                conn.WriteJSON(map[string]interface{}{
+                    "type": "message",
+                    "data": v,
+                })
+            case *events.Connected:
+                conn.WriteJSON(map[string]string{"status": "connected", "clientID": clientID})
+            case *events.Disconnected:
+                conn.WriteJSON(map[string]string{"status": "disconnected"})
+            }
+        }
+    }()
+
+    // Connect to WhatsApp
+    err = client.Connect()
+    if err != nil {
+        conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to connect: %v", err)})
+        return
+    }
+	
+
+    // Wait for connection or timeout
+    select {
+    case <-time.After(5 * time.Minute):
+        conn.WriteJSON(map[string]string{"error": "Authentication timed out"})
+    }
+
+    cm.clients[clientID] = client
+}
+
 func main() {
+	
 	waBinary.IndentXML = true
 	flag.Parse()
 
@@ -70,99 +239,35 @@ func main() {
 	log = waLog.Stdout("Main", logLevel, true)
 
 	dbLog := waLog.Stdout("Database", logLevel, true)
-	storeContainer, err := sqlstore.New(*dbDialect, *dbAddress, dbLog)
-	if err != nil {
-		log.Errorf("Failed to connect to database: %v", err)
-		return
-	}
-	device, err := storeContainer.GetFirstDevice()
-	if err != nil {
-		log.Errorf("Failed to get device: %v", err)
-		return
-	}
+    container, err := sqlstore.New("sqlite3", "file:mdtest.db?_foreign_keys=on", dbLog)
+    if err != nil {
+        log.Errorf("Failed to connect to database: %v", err)
+        return
+    }
+	manager := NewClientManager(container)
 
-	cli = whatsmeow.NewClient(device, waLog.Stdout("Client", logLevel, true))
-	var isWaitingForPair atomic.Bool
-	cli.PrePairCallback = func(jid types.JID, platform, businessName string) bool {
-		isWaitingForPair.Store(true)
-		defer isWaitingForPair.Store(false)
-		log.Infof("Pairing %s (platform: %q, business name: %q). Type r within 3 seconds to reject pair", jid, platform, businessName)
-		select {
-		case reject := <-pairRejectChan:
-			if reject {
-				log.Infof("Rejecting pair")
-				return false
-			}
-		case <-time.After(3 * time.Second):
-		}
-		log.Infof("Accepting pair")
-		return true
-	}
+	// Initialize Gin router
+    router := gin.Default()
 
-	ch, err := cli.GetQRChannel(context.Background())
-	if err != nil {
-		// This error means that we're already logged in, so ignore it.
-		if !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			log.Errorf("Failed to get QR channel: %v", err)
-		}
-	} else {
-		go func() {
-			for evt := range ch {
-				if evt.Event == "code" {
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				} else {
-					log.Infof("QR channel result: %s", evt.Event)
-				}
-			}
-		}()
-	}
+    // Add CORS middleware
+    router.Use(cors.New(cors.Config{
+        AllowOrigins:     []string{"http://localhost:3000"},
+        AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+        AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
+        ExposeHeaders:    []string{"Content-Length"},
+        AllowCredentials: true,
+        MaxAge:           12 * time.Hour,
+    }))
 
-	cli.AddEventHandler(handler)
-	err = cli.Connect()
-	if err != nil {
-		log.Errorf("Failed to connect: %v", err)
-		return
-	}
+    // Define routes
+    router.POST("/send", gin.WrapF(manager.sendMessageHandler))
+    router.GET("/ws", gin.WrapF(manager.handleWebSocket))
 
-	c := make(chan os.Signal, 1)
-	input := make(chan string)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		defer close(input)
-		scan := bufio.NewScanner(os.Stdin)
-		for scan.Scan() {
-			line := strings.TrimSpace(scan.Text())
-			if len(line) > 0 {
-				input <- line
-			}
-		}
-	}()
-	for {
-		select {
-		case <-c:
-			log.Infof("Interrupt received, exiting")
-			cli.Disconnect()
-			return
-		case cmd := <-input:
-			if len(cmd) == 0 {
-				log.Infof("Stdin closed, exiting")
-				cli.Disconnect()
-				return
-			}
-			if isWaitingForPair.Load() {
-				if cmd == "r" {
-					pairRejectChan <- true
-				} else if cmd == "a" {
-					pairRejectChan <- false
-				}
-				continue
-			}
-			args := strings.Fields(cmd)
-			cmd = args[0]
-			args = args[1:]
-			go handleCmd(strings.ToLower(cmd), args)
-		}
-	}
+    // Start the server
+    log.Infof("Starting API server on :8080")
+    if err := router.Run(":8080"); err != nil {
+        log.Errorf("Failed to start server: %v", err)
+    }
 }
 
 func parseJID(arg string) (types.JID, bool) {
