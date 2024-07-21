@@ -14,17 +14,12 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	"os"
-	"os/signal"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 	qrcode "github.com/skip2/go-qrcode"
 	"go.mau.fi/whatsmeow"
@@ -32,7 +27,6 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
@@ -46,11 +40,9 @@ var debugLogs = flag.Bool("debug", false, "Enable debug logs?")
 // var requestFullSync = flag.Bool("request-full-sync", false, "Request full (1 year) history sync when logging in?")
 
 type ClientManager struct {
-    clients       map[string]*whatsmeow.Client
-    mutex         sync.RWMutex
+    container     *sqlstore.Container
     dbLog         waLog.Logger
     eventChannel  chan interface{}
-    container     *sqlstore.Container
     ctx           context.Context
     cancel        context.CancelFunc
 }
@@ -58,13 +50,17 @@ type ClientManager struct {
 func NewClientManager(container *sqlstore.Container) *ClientManager {
     ctx, cancel := context.WithCancel(context.Background())
     return &ClientManager{
-        clients:      make(map[string]*whatsmeow.Client),
         dbLog:        waLog.Stdout("Database", logLevel, true),
         eventChannel: make(chan interface{}, 100),
         container:    container,
         ctx:          ctx,
         cancel:       cancel,
     }
+}
+
+// Update the getRegistrationID method
+func (cm *ClientManager) getRegistrationID(sessionID string) (uint32, error) {
+    return cm.container.GetSessionRegistrationID(sessionID)
 }
 
 func (cm *ClientManager) eventHandler(evt interface{}) {
@@ -76,10 +72,55 @@ func (cm *ClientManager) eventHandler(evt interface{}) {
     }
 }
 
+func (cm *ClientManager) generateQRCode(ctx context.Context, sessionID string) (string, error) {
+	//TODO remember JID and getDevice using it
+    deviceStore, err := cm.container.GetFirstDevice()
+    if err != nil {
+        return "", fmt.Errorf("failed to get device: %v", err)
+    }
+
+    client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
+    client.AddEventHandler(cm.eventHandler)
+
+    qrChan, err := client.GetQRChannel(cm.ctx)
+    if err != nil {
+        if errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
+            err = client.Connect()
+            if err != nil {
+                return "", fmt.Errorf("failed to connect to WhatsApp: %v", err)
+            }
+            return "", nil // No QR code needed, already connected
+        }
+        return "", fmt.Errorf("failed to get QR channel: %v", err)
+    }
+
+    select {
+    case evt := <-qrChan:
+		log.Infof("QR code event: %+v", evt)
+        if evt.Event == "code" {
+            png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
+            if err != nil {
+                return "", fmt.Errorf("failed to generate QR code: %v", err)
+            }
+            base64QR := base64.StdEncoding.EncodeToString(png)
+            return base64QR, nil
+        }
+    case <-time.After(60 * time.Second):
+        return "", fmt.Errorf("timeout waiting for QR code")
+    }
+    return "", fmt.Errorf("unexpected error generating QR code")
+}
+
+func (cm *ClientManager) checkAuthStatus(sessionID string) string {
+	log.Infof("Checking auth status for session %s", sessionID)
+    return "authenticated"
+}
+
+
 type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
-	ClientID  string `json:"clientID"`
+	SessionID string `json:"sessionID"`
 }
 
 type SendMessageResponse struct {
@@ -113,7 +154,13 @@ func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Reque
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
     defer cancel()
 
-    deviceStore, err := cm.container.GetFirstDevice()
+	regID, err := cm.getRegistrationID(req.SessionID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+    deviceStore, err := cm.container.GetDeviceByRegistrationID(regID)
     if err != nil {
         log.Errorf("Failed to get device: %v", err)
         http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -139,131 +186,110 @@ func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Reque
     json.NewEncoder(w).Encode(SendMessageResponse{Success: true})
 }
 
-var upgrader = websocket.Upgrader{
-    CheckOrigin: func(r *http.Request) bool {
-        // In production, implement proper origin checking
-        return true
-    },
-    ReadBufferSize:  1024,
-    WriteBufferSize: 1024,
-}
-
-
-func (cm *ClientManager) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-    conn, err := upgrader.Upgrade(w, r, nil)
-    if err != nil {
-        log.Errorf("Failed to upgrade connection: %v", err)
-        return
-    }
-    defer conn.Close()
-
-    clientID := uuid.New().String()
+func (cm *ClientManager) startClientSession(sessionID string) (<-chan string, <-chan interface{}, uint32, error) {
+	qrCodeChan := make(chan string, 1)
+    eventChan := make(chan interface{}, 100)
 
     deviceStore, err := cm.container.GetFirstDevice()
     if err != nil {
-        log.Errorf("Failed to get device: %v", err)
-        conn.WriteJSON(map[string]string{"error": "Failed to get device"})
-        return
+        return nil, nil, 0, fmt.Errorf("failed to get device: %v", err)
+    }
+
+    // Store the registration ID in the database
+    err = cm.container.StoreSessionRegistrationID(sessionID, deviceStore.RegistrationID)
+    if err != nil {
+		log.Errorf("Failed to store registration ID: %v", err)
+        return nil, nil, 0, fmt.Errorf("failed to store registration ID: %v", err)
     }
 
     client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
-    client.AddEventHandler(cm.eventHandler)
+    client.AddEventHandler(func(evt interface{}) {
+        eventChan <- evt
+    })
 
     qrChan, err := client.GetQRChannel(cm.ctx)
     if err != nil {
         if errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
             err = client.Connect()
             if err != nil {
-                log.Errorf("Failed to connect to WhatsApp: %v", err)
-                conn.WriteJSON(map[string]string{"error": "Failed to connect to WhatsApp"})
-                return
+                return nil, nil, 0, fmt.Errorf("failed to connect to WhatsApp: %v", err)
             }
-            cm.mutex.Lock()
-            cm.clients[clientID] = client
-            cm.mutex.Unlock()
-            return
+            return nil, nil, deviceStore.RegistrationID, nil 
         }
-        conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to get QR channel: %v", err)})
-        return
+        return nil, nil, deviceStore.RegistrationID, fmt.Errorf("failed to get QR channel: %v", err)
     }
 
     go func() {
         for evt := range qrChan {
             if evt.Event == "code" {
-                png, err := qrcode.Encode(evt.Code, qrcode.Medium, 256)
-                if err != nil {
-                    conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to generate QR code: %v", err)})
-                    return
-                }
+                png, _ := qrcode.Encode(evt.Code, qrcode.Medium, 256)
                 base64QR := base64.StdEncoding.EncodeToString(png)
-                conn.WriteJSON(map[string]string{"qrCode": base64QR})
-            } else {
-                conn.WriteJSON(map[string]string{"status": evt.Event})
+                qrCodeChan <- base64QR
             }
         }
     }()
 
     go func() {
+        err := client.Connect()
+        if err != nil {
+            log.Errorf("Failed to connect: %v", err)
+            return
+        }
+
+        // Now wait for events indefinitely
         for {
             select {
-            case evt := <-cm.eventChannel:
-                switch v := evt.(type) {
-                case *events.Message:
-                    conn.WriteJSON(map[string]interface{}{
-                        "type": "message",
-                        "data": v,
-                    })
-                case *events.Connected:
-                    conn.WriteJSON(map[string]string{"status": "connected", "clientID": clientID})
-                case *events.Disconnected:
-                    conn.WriteJSON(map[string]string{"status": "disconnected"})
-                }
             case <-cm.ctx.Done():
                 return
             }
         }
     }()
+    return qrCodeChan, eventChan, deviceStore.RegistrationID, nil
+}
 
-    err = client.Connect()
+func (cm *ClientManager) handleQRCodeGeneration(w http.ResponseWriter, r *http.Request) {
+    sessionID := uuid.New().String()
+    qrCodeChan, _, registrationID, err := cm.startClientSession(sessionID)
     if err != nil {
-        conn.WriteJSON(map[string]string{"error": fmt.Sprintf("Failed to connect: %v", err)})
+        http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
 
-    cm.mutex.Lock()
-    cm.clients[clientID] = client
-    cm.mutex.Unlock()
+    select {
+    case qrCode := <-qrCodeChan:
+        json.NewEncoder(w).Encode(map[string]string{
+            "sessionID": sessionID,
+            "qrCode": qrCode,
+			"registrationID": fmt.Sprintf("%d", registrationID),
+        })
+    case <-time.After(30 * time.Second):
+        http.Error(w, "Timeout waiting for QR code", http.StatusRequestTimeout)
+    }
+}
 
-    // Implement ping/pong for keepalive
-    go func() {
-        ticker := time.NewTicker(30 * time.Second)
-        defer ticker.Stop()
+func (cm *ClientManager) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
+    sessionID := r.URL.Query().Get("sessionID")
+    
+    // Set headers for SSE
+    w.Header().Set("Content-Type", "text/event-stream")
+    w.Header().Set("Cache-Control", "no-cache")
+    w.Header().Set("Connection", "keep-alive")
 
-        for {
-            select {
-            case <-ticker.C:
-                if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
-                    log.Errorf("Failed to send ping: %v", err)
-                    return
-                }
-            case <-cm.ctx.Done():
+    // Check authentication status periodically
+    for {
+        select {
+        case <-r.Context().Done():
+            return
+        case <-time.After(5 * time.Second):
+            status := cm.checkAuthStatus(sessionID)
+            fmt.Fprintf(w, "data: %s\n\n", status)
+            w.(http.Flusher).Flush()
+            
+            if status == "authenticated" {
                 return
             }
         }
-    }()
-
-    for {
-        _, _, err := conn.ReadMessage()
-        if err != nil {
-            log.Errorf("WebSocket read error: %v", err)
-            break
-        }
     }
-
-    cm.mutex.Lock()
-    delete(cm.clients, clientID)
-    cm.mutex.Unlock()
-    client.Disconnect()
 }
 
 func main() {
@@ -285,10 +311,9 @@ func main() {
     }
 	manager := NewClientManager(container)
 
-	// Initialize Gin router
 	router := gin.Default()
     router.Use(cors.New(cors.Config{
-        AllowOrigins:     []string{"http://localhost:3000"}, // Update this for production
+        AllowOrigins:     []string{"http://localhost:3000"}, 
         AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
         AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
         ExposeHeaders:    []string{"Content-Length"},
@@ -297,31 +322,10 @@ func main() {
     }))
 
     router.POST("/send", gin.WrapF(manager.sendMessageHandler))
-    router.GET("/ws", gin.WrapF(manager.handleWebSocket))
+	router.GET("/generate-qr", gin.WrapF(manager.handleQRCodeGeneration))
+    router.GET("/auth-status", gin.WrapF(manager.handleAuthStatus))
 
-    srv := &http.Server{
-        Addr:    ":8080",
-        Handler: router,
-    }
-
-    go func() {
-        if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Errorf("Failed to start server: %v", err)
-        }
-    }()
-
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    <-quit
-
-    log.Infof("Shutting down server...")
-    manager.cancel()
-
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    if err := srv.Shutdown(ctx); err != nil {
-        log.Errorf("Server forced to shutdown: %v", err)
-    }
+	router.Run(":8080")
 
     log.Infof("Server exiting")
 }
