@@ -364,7 +364,7 @@ func main() {
 	log = waLog.Stdout("Main", logLevel, true)
 
 	dbLog := waLog.Stdout("Database", logLevel, true)
-    container, err := sqlstore.New("sqlite3", "file:mdtest.db?_foreign_keys=on", dbLog)
+    container, err := sqlstore.New("sqlite3", "file:../data/mdtest.db?_foreign_keys=on", dbLog)
     if err != nil {
         log.Errorf("Failed to connect to database: %v", err)
         return
@@ -373,7 +373,7 @@ func main() {
 
 	router := gin.Default()
     router.Use(cors.New(cors.Config{
-        AllowOrigins:     []string{"http://localhost:3000"}, 
+        AllowOrigins:     []string{"http://localhost:3000", "https://omnimap-seven.vercel.app"}, 
         AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
         AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
         ExposeHeaders:    []string{"Content-Length"},
@@ -382,6 +382,7 @@ func main() {
     }))
 
     router.POST("/send", gin.WrapF(manager.sendMessageHandler))
+    // MAYBE POST REQUEST. 
 	router.GET("/generate-qr", gin.WrapF(manager.handleQRCodeGeneration))
     router.GET("/auth-status", gin.WrapF(manager.handleAuthStatus))
 	router.GET("/contacts", gin.WrapF(manager.getAllContactsHandler))
