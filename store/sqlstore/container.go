@@ -187,6 +187,26 @@ func (c *Container) GetDevice(jid types.JID) (*store.Device, error) {
 	return sess, err
 }
 
+const getDeviceByRegistrationIDQuery = `
+SELECT jid, registration_id, noise_key, identity_key,
+       signed_pre_key, signed_pre_key_id, signed_pre_key_sig,
+       adv_key, adv_details, adv_account_sig, adv_account_sig_key, adv_device_sig,
+       platform, business_name, push_name, facebook_uuid
+FROM whatsmeow_device
+WHERE registration_id = $1
+`
+
+// GetDeviceByRegistrationID finds the device with the specified registration ID in the database.
+//
+// If the device is not found, nil is returned instead.
+func (c *Container) GetDeviceByRegistrationID(registrationID uint32) (*store.Device, error) {
+	device, err := c.scanDevice(c.db.QueryRow(getDeviceByRegistrationIDQuery, registrationID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return device, err
+}
+
 const (
 	insertDeviceQuery = `
 		INSERT INTO whatsmeow_device (jid, registration_id, noise_key, identity_key,
@@ -267,4 +287,33 @@ func (c *Container) DeleteDevice(store *store.Device) error {
 	}
 	_, err := c.db.Exec(deleteDeviceQuery, store.ID.String())
 	return err
+}
+
+// Add these methods to the Container struct in dev/whatsmeow/store/sqlstore/container.go
+
+const (
+    insertSessionRegistrationIDQuery = `
+        INSERT INTO whatsmeow_session_registration (session_id, registration_id)
+        VALUES ($1, $2)
+        ON CONFLICT (session_id) DO UPDATE SET registration_id = excluded.registration_id
+    `
+    getSessionRegistrationIDQuery = `
+        SELECT registration_id FROM whatsmeow_session_registration WHERE session_id = $1
+    `
+)
+
+// StoreSessionRegistrationID stores the registration ID for a given session ID
+func (c *Container) StoreSessionRegistrationID(sessionID string, registrationID uint32) error {
+    _, err := c.db.Exec(insertSessionRegistrationIDQuery, sessionID, registrationID)
+    return err
+}
+
+// GetSessionRegistrationID retrieves the registration ID for a given session ID
+func (c *Container) GetSessionRegistrationID(sessionID string) (uint32, error) {
+    var registrationID uint32
+    err := c.db.QueryRow(getSessionRegistrationIDQuery, sessionID).Scan(&registrationID)
+    if err == sql.ErrNoRows {
+        return 0, fmt.Errorf("no registration ID found for session ID: %s", sessionID)
+    }
+    return registrationID, err
 }

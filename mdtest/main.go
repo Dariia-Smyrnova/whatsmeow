@@ -186,6 +186,66 @@ func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Reque
     json.NewEncoder(w).Encode(SendMessageResponse{Success: true})
 }
 
+func (cm *ClientManager) getAllContactsHandler(w http.ResponseWriter, r *http.Request) {
+    sessionID := r.URL.Query().Get("sessionID")
+    if sessionID == "" {
+        http.Error(w, "Session ID is required", http.StatusBadRequest)
+        return
+    }
+
+    regID, err := cm.getRegistrationID(sessionID)
+    if err != nil {
+        http.Error(w, "Failed to get registration ID", http.StatusInternalServerError)
+        return
+    }
+
+    deviceStore, err := cm.container.GetDeviceByRegistrationID(regID)
+    if err != nil {
+        log.Errorf("Failed to get device: %v", err)
+        http.Error(w, "Internal server error", http.StatusInternalServerError)
+        return
+    }
+
+    client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
+    err = client.Connect()
+    if err != nil {
+        log.Errorf("Failed to connect: %v", err)
+        http.Error(w, "Failed to connect", http.StatusInternalServerError)
+        return
+    }
+    defer client.Disconnect()
+
+    store := client.Store.Contacts
+    contacts, err := store.GetAllContacts()
+    if err != nil {
+        log.Errorf("Failed to get contacts: %v", err)
+        http.Error(w, "Failed to get contacts", http.StatusInternalServerError)
+        return
+    }
+
+    // Convert map[types.JID]types.ContactInfo to a slice for easier JSON serialization
+    contactsList := make([]struct {
+        JID  string           `json:"jid"`
+        Info types.ContactInfo `json:"info"`
+    }, 0, len(contacts))
+
+	fmt.Printf("Number of contacts: %d\n", len(contacts))
+	// for jid, info := range contacts {
+	// 	contactsList = append(contactsList, struct {
+	// 		JID  string           `json:"jid"`
+	// 		Info types.ContactInfo `json:"info"`
+	// 	}{
+	// 		JID:  jid.String(),
+	// 		Info: info,
+	// 	})
+	// 	fmt.Printf("Added contact: %s\n", jid.String())
+	// }
+	fmt.Printf("Number of items in contactsList: %d\n", len(contactsList))
+
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(contactsList)
+}
+
 func (cm *ClientManager) startClientSession(sessionID string) (<-chan string, <-chan interface{}, uint32, error) {
 	qrCodeChan := make(chan string, 1)
     eventChan := make(chan interface{}, 100)
@@ -324,6 +384,7 @@ func main() {
     router.POST("/send", gin.WrapF(manager.sendMessageHandler))
 	router.GET("/generate-qr", gin.WrapF(manager.handleQRCodeGeneration))
     router.GET("/auth-status", gin.WrapF(manager.handleAuthStatus))
+	router.GET("/contacts", gin.WrapF(manager.getAllContactsHandler))
 
 	router.Run(":8080")
 

@@ -221,6 +221,15 @@ func upgradeV1(tx *sql.Tx, _ *Container) error {
 	)`)
 	if err != nil {
 		return err
+
+	}	
+	
+	_, err = tx.Exec(`CREATE TABLE IF NOT EXISTS whatsmeow_session_registration (
+        session_id TEXT PRIMARY KEY,
+        registration_id INTEGER NOT NULL
+    );`)
+	if err != nil {
+		return err
 	}
 	return nil
 }

@@ -617,6 +617,7 @@ func (s *SQLStore) getContact(user types.JID) (*types.ContactInfo, error) {
 	return info, nil
 }
 
+
 func (s *SQLStore) GetContact(user types.JID) (types.ContactInfo, error) {
 	s.contactCacheLock.Lock()
 	info, err := s.getContact(user)
