@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile  # You'll need to create this Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - FLY_REGION=sin  # Simulating the primary region
+    volumes:
+      - app_data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+volumes:
+  app_data:
+    driver: local

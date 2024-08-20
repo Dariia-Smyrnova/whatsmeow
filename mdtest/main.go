@@ -247,13 +247,10 @@ func (cm *ClientManager) startClientSession(sessionID string) (<-chan string, <-
 	qrCodeChan := make(chan string, 1)
     eventChan := make(chan interface{}, 100)
 
-    deviceStore, err := cm.container.GetFirstDevice()
-    if err != nil {
-        return nil, nil, 0, fmt.Errorf("failed to get device: %v", err)
-    }
+    deviceStore := cm.container.NewDevice()
 
     // Store the registration ID in the database
-    err = cm.container.StoreSessionRegistrationID(sessionID, deviceStore.RegistrationID)
+    err := cm.container.StoreSessionRegistrationID(sessionID, deviceStore.RegistrationID)
     if err != nil {
 		log.Errorf("Failed to store registration ID: %v", err)
         return nil, nil, 0, fmt.Errorf("failed to store registration ID: %v", err)
