@@ -73,12 +73,8 @@ func (cm *ClientManager) eventHandler(evt interface{}) {
 }
 
 func (cm *ClientManager) generateQRCode(ctx context.Context, sessionID string) (string, error) {
-	//TODO remember JID and getDevice using it
-    deviceStore, err := cm.container.GetFirstDevice()
-    if err != nil {
-        return "", fmt.Errorf("failed to get device: %v", err)
-    }
-
+	
+    deviceStore := cm.container.NewDevice()
     client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
     client.AddEventHandler(cm.eventHandler)
 
@@ -129,9 +125,10 @@ type SendMessageResponse struct {
 }
 
 func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Request) {
+    log.Infof("Sending message:", r)
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
+		return 
 	}
 
 	var req SendMessageRequest
@@ -364,7 +361,7 @@ func main() {
 	log = waLog.Stdout("Main", logLevel, true)
 
 	dbLog := waLog.Stdout("Database", logLevel, true)
-    container, err := sqlstore.New("sqlite3", "file:../data/mdtest.db?_foreign_keys=on", dbLog)
+    container, err := sqlstore.New("sqlite3", `file:../data/mdtest.db?_foreign_keys=on`, dbLog)
     if err != nil {
         log.Errorf("Failed to connect to database: %v", err)
         return
