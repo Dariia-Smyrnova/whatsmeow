@@ -124,6 +124,10 @@ type SendMessageResponse struct {
     Error     string `json:"error,omitempty"`
 }
 
+type ValidateSessionRequest struct {
+    SessionID string `json:"SessionID"`
+}
+
 func (cm *ClientManager) sendMessageHandler(w http.ResponseWriter, r *http.Request) {
     log.Infof("Sending message:", r)
 	if r.Method != http.MethodPost {
@@ -241,6 +245,46 @@ func (cm *ClientManager) getAllContactsHandler(w http.ResponseWriter, r *http.Re
 
     w.Header().Set("Content-Type", "application/json")
     json.NewEncoder(w).Encode(contactsList)
+}
+
+func (cm *ClientManager) validateSessionHandler(w http.ResponseWriter, r *http.Request) {
+    if r.Method != http.MethodPost {
+        http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
+
+    var req ValidateSessionRequest
+    err := json.NewDecoder(r.Body).Decode(&req)
+    if err != nil {
+        http.Error(w, "Invalid request body", http.StatusBadRequest)
+        return
+    }
+
+    // Check if the session exists and is valid
+    regID, err := cm.getRegistrationID(req.SessionID)
+    if err != nil {
+        json.NewEncoder(w).Encode(map[string]bool{"valid": false})
+        return
+    }
+
+    deviceStore, err := cm.container.GetDeviceByRegistrationID(regID)
+    if err != nil {
+        log.Errorf("Failed to get device: %v", err)
+        json.NewEncoder(w).Encode(map[string]bool{"valid": false})
+        return
+    }
+
+    client := whatsmeow.NewClient(deviceStore, waLog.Stdout("Client", logLevel, true))
+    err = client.Connect()
+    if err != nil {
+        log.Errorf("Failed to connect: %v", err)
+        json.NewEncoder(w).Encode(map[string]bool{"valid": false})
+        return
+    }
+    defer client.Disconnect()
+
+    // If we've made it this far, the session is valid
+    json.NewEncoder(w).Encode(map[string]bool{"valid": true})
 }
 
 func (cm *ClientManager) startClientSession(sessionID string) (<-chan string, <-chan interface{}, uint32, error) {
@@ -367,7 +411,7 @@ func main() {
 
 	router := gin.Default()
     router.Use(cors.New(cors.Config{
-        AllowOrigins:     []string{"http://localhost:3000", "https://omnimap-seven.vercel.app"}, 
+        AllowOrigins:     []string{"http://localhost:3000", "https://omnifunnel.ai/"}, 
         AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
         AllowHeaders:     []string{"Origin", "Content-Length", "Content-Type", "Authorization"},
         ExposeHeaders:    []string{"Content-Length"},
@@ -380,6 +424,7 @@ func main() {
 	router.GET("/generate-qr", gin.WrapF(manager.handleQRCodeGeneration))
     router.GET("/auth-status", gin.WrapF(manager.handleAuthStatus))
 	router.GET("/contacts", gin.WrapF(manager.getAllContactsHandler))
+    router.POST("/validate-session", gin.WrapF(manager.validateSessionHandler))
 
 	router.Run(":8080")
 
